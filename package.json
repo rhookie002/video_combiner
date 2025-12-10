@@ -1,19 +1,15 @@
 {
-  "name": "video-combo-nodejs",
+  "name": "video-combo-backend",
   "version": "1.0.0",
-  "main": "backend/server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node backend/server.js",
-    "start:dev": "nodemon backend/server.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.0.0",
     "express": "^4.18.2",
     "node-fetch": "^2.6.7",
+    "dotenv": "^16.0.0",
+    "cors": "^2.8.5",
     "body-parser": "^1.20.2"
-  },
-  "engines": {
-    "node": "18.x"
   }
 }
