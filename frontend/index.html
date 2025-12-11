@@ -88,143 +88,607 @@ button.generate-btn:hover { background:#2563eb; box-shadow: 0 4px 12px rgba(59,1
 </div>
 
 <script>
-// Frontend now requests /config to get Supabase keys (set them as env on Railway)
-async function getConfig(){ 
-    try {
-        const r = await fetch('/config');
-        return await r.json();
-    } catch(e) {
-        console.error('Failed to get config', e);
-        return { supabaseUrl: '', supabaseKey: '' };
-    }
+/* === CONFIG + SUPABASE INIT ===
+   The frontend fetches /config (served by your backend) to get SUPABASE_URL and SUPABASE_KEY.
+   If you already set supabase in the global scope differently, you can skip getConfig/init.
+*/
+async function getConfig() {
+  try {
+    const r = await fetch('/config');
+    if (!r.ok) throw new Error('Failed to fetch config');
+    return await r.json();
+  } catch (err) {
+    console.error('getConfig error', err);
+    return { supabaseUrl: '', supabaseKey: '' };
+  }
 }
 
-// Initialize after obtaining config
-let supabase;
+let supabase = null;
 (async () => {
-    const config = await getConfig();
-    if (!config.supabaseUrl || !config.supabaseKey) {
-        document.getElementById('status').innerText = 'Supabase config missing. Set env vars in backend.';
-        return;
-    }
-    supabase = window.supabase.createClient(config.supabaseUrl, config.supabaseKey);
+  const cfg = await getConfig();
+  if (!cfg.supabaseUrl || !cfg.supabaseKey) {
+    document.getElementById('status').innerText = 'Supabase config missing. Set env vars in backend.';
+    return;
+  }
+  supabase = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey);
 })();
 
-// The rest of your original JS remains, but endpoints changed to proxy through backend:
-// - createFolder() -> POST /api/create-folder
-// - sendToN8N() -> POST /api/send-n8n
-// - retryGoogleDriveUpload() -> POST /api/retry-google-drive
+/* === GLOBAL STATE === */
+let combinationData = [];      // original combos for retry
+let failedCombinations = [];   // { combo, folderName, index, error }
+let MAX_CONCURRENT = 15;       // batch size
 
-// ---- Reused original functions (trimmed for brevity) ----
-// For clarity and to keep file concise, this file includes the main functions used in your original page.
+/* === UI Helpers: previews & small helpers === */
+function showPreviews(inputId, listId) {
+  const input = document.getElementById(inputId);
+  const list = document.getElementById(listId);
+  list.innerHTML = '';
+  const filesArray = Array.from(input.files);
 
-// Global storage for retry functionality
-let combinationData = [];
-let failedCombinations = [];
+  filesArray.forEach((file, index) => {
+    const url = URL.createObjectURL(file);
+    const container = document.createElement('div');
 
-function showPreviews(inputId, listId){
-    const input = document.getElementById(inputId);
-    const list = document.getElementById(listId);
-    list.innerHTML = "";
+    container.innerHTML = `
+      <video width="160" height="90" controls src="${url}"></video>
+      <p>${file.name}</p>
+      <button>Remove</button>
+    `;
 
-    const filesArray = Array.from(input.files);
-
-    filesArray.forEach((file, index) => {
-        const url = URL.createObjectURL(file);
-        const container = document.createElement("div");
-
-        container.innerHTML = `
-            <video width="160" height="90" controls src="${url}"></video>
-            <p>${file.name}</p>
-            <button>Remove</button>
-        `;
-
-        container.querySelector("button").addEventListener("click", () => {
-            filesArray.splice(index, 1); // remove file
-            const dataTransfer = new DataTransfer();
-            filesArray.forEach(f => dataTransfer.items.add(f));
-            input.files = dataTransfer.files;
-
-            showPreviews(inputId, listId); // re-render
-        });
-
-        list.appendChild(container);
+    container.querySelector('button').addEventListener('click', () => {
+      filesArray.splice(index, 1); // remove file
+      const dataTransfer = new DataTransfer();
+      filesArray.forEach(f => dataTransfer.items.add(f));
+      input.files = dataTransfer.files;
+      showPreviews(inputId, listId); // re-render
     });
+
+    list.appendChild(container);
+  });
 }
 
-document.getElementById('hook').addEventListener('change',()=>showPreviews('hook','hookList'));
-document.getElementById('lead').addEventListener('change',()=>showPreviews('lead','leadList'));
-document.getElementById('body').addEventListener('change',()=>showPreviews('body','bodyList'));
+document.getElementById('hook').addEventListener('change', () => showPreviews('hook', 'hookList'));
+document.getElementById('lead').addEventListener('change', () => showPreviews('lead', 'leadList'));
+document.getElementById('body').addEventListener('change', () => showPreviews('body', 'bodyList'));
 
+/* === Supabase upload helper ===
+   Uses supabase.storage.from(bucket).upload(path, file, options)
+   Returns an object with publicUrl, fileName, originalFilename, fileType, filePath, folder, bucket
+*/
 async function uploadToSupabase(file, folderName = '', fileType = '', combinationIndex = 0, bucket = 'assets') {
-    try {
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${Math.random().toString(36).substring(2)}_${Date.now()}.${fileExt}`;
-        const filePath = `video-clips/${folderName}/${fileType}/${fileName}`;
-        const { data, error } = await supabase.storage
-            .from(bucket)
-            .upload(filePath, file, {
-                cacheControl: '3600',
-                upsert: false,
-                metadata: {
-                    originalFilename: file.name,
-                    fileType: fileType,
-                    fileSize: file.size,
-                    mimeType: file.type,
-                    combinationIndex: combinationIndex,
-                    uploadedAt: new Date().toISOString(),
-                    folder: folderName,
-                    category: 'video-combination',
-                    storagePath: filePath
-                }
-            });
-        if (error) throw error;
-        const { data: { publicUrl } } = supabase.storage.from(bucket).getPublicUrl(filePath);
-        return { publicUrl, fileName, originalFilename: file.name, fileType, filePath, folder: folderName, bucket };
-    } catch (error) {
-        console.error('Error uploading to Supabase:', error);
-        throw error;
-    }
-}
+  if (!supabase) throw new Error('Supabase client not initialized');
 
-async function sendToN8N(hookData, leadData, bodyData, folderName, combinationIndex) {
-    try {
-        const payload = { hookData, leadData, bodyData, folderName, combinationIndex, timestamp: new Date().toISOString() };
-        const r = await fetch('/api/send-n8n', {
-            method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
-        });
-        if (!r.ok) {
-            const err = await r.text();
-            throw new Error(err || 'n8n request failed');
+  try {
+    const fileExt = (file.name.split('.').pop() || '').replace(/\?.*$/, '');
+    const fileName = `${Math.random().toString(36).substring(2)}_${Date.now()}.${fileExt}`;
+    const filePath = `video-clips/${folderName}/${fileType}/${fileName}`;
+
+    const { data, error } = await supabase.storage
+      .from(bucket)
+      .upload(filePath, file, {
+        cacheControl: '3600',
+        upsert: false,
+        metadata: {
+          originalFilename: file.name,
+          fileType,
+          fileSize: file.size,
+          mimeType: file.type,
+          combinationIndex,
+          uploadedAt: new Date().toISOString(),
+          folder: folderName,
+          category: 'video-combination',
+          storagePath: filePath
         }
-        return await r.json();
-    } catch (error) {
-        console.error('Error sending to n8n:', error);
-        throw error;
+      });
+
+    if (error) {
+      // If file already exists or other error
+      throw error;
     }
+
+    const { data: publicData, error: pubErr } = supabase.storage.from(bucket).getPublicUrl(filePath);
+    if (pubErr) throw pubErr;
+    // publicData has: publicUrl
+    return {
+      publicUrl: publicData.publicUrl,
+      fileName,
+      originalFilename: file.name,
+      fileType,
+      filePath,
+      folder: folderName,
+      bucket
+    };
+  } catch (error) {
+    console.error('uploadToSupabase error', error);
+    throw error;
+  }
 }
 
+/* === Proxy to backend: sendToN8N (combination processor) ===
+   POSTs to /api/send-n8n which proxies to your lambda/n8n
+*/
+async function sendToN8N(hookData, leadData, bodyData, folderName, combinationIndex) {
+  try {
+    const payload = { hookData, leadData, bodyData, folderName, combinationIndex, timestamp: new Date().toISOString() };
+    const r = await fetch('/api/send-n8n', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => null);
+      throw new Error(txt || `n8n proxy returned ${r.status}`);
+    }
+
+    const result = await r.json();
+    if (result.error) throw new Error(result.error);
+    return result;
+  } catch (err) {
+    console.error('sendToN8N error', err);
+    throw err;
+  }
+}
+
+/* === Proxy createFolder ===
+   Calls /api/create-folder which proxies to your n8n create-folder webhook
+*/
 async function createFolder(folderName) {
-    try {
-        const r = await fetch('/api/create-folder', {
-            method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ folderName, timestamp: new Date().toISOString(), action: 'create-folder' })
-        });
-        if (!r.ok) throw new Error('Folder creation failed');
-        return await r.json();
-    } catch (err) {
-        console.error('Error creating folder:', err);
-        throw err;
+  try {
+    const r = await fetch('/api/create-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folderName, timestamp: new Date().toISOString(), action: 'create-folder' })
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => null);
+      throw new Error(txt || `create-folder proxy returned ${r.status}`);
     }
+
+    const result = await r.json();
+    if (result.error) throw new Error(result.error);
+    if (result.status && result.status !== 'success') {
+      throw new Error(result.message || 'Folder creation failed');
+    }
+    return result;
+  } catch (err) {
+    console.error('createFolder error', err);
+    throw err;
+  }
 }
 
-// All other functions (processCombinationParallel, generateVideo, retry logic, UI updates) remain the same as in your original file.
-// To keep this file readable, those functions are included below exactly as you provided originally, adjusted to call the proxied endpoints.
+/* === Main: generateVideo ===
+   1) builds combos
+   2) creates UI rows
+   3) creates folder via createFolder()
+   4) processes combos in batches
+*/
+async function generateVideo() {
+  const hooks = Array.from(document.getElementById('hook').files);
+  const leads = Array.from(document.getElementById('lead').files);
+  const bodies = Array.from(document.getElementById('body').files);
+  const folderName = document.getElementById('folder-name').value.trim();
 
-/* === ORIGINAL LONG FUNCTIONS COPY === */
-// For brevity in this generated project I will include the rest of your original script unchanged,
-// but with fetch targets updated to the backend proxies (done above for createFolder and sendToN8N).
+  if (!folderName) {
+    alert('Please enter a folder name.');
+    return;
+  }
+  if (hooks.length === 0 || leads.length === 0 || bodies.length === 0) {
+    alert('Please upload at least one clip in each category.');
+    return;
+  }
 
-// (To view the full JS easily, open this file in the generated project directory.)
+  // Build all combinations
+  const combinations = [];
+  hooks.forEach(h => leads.forEach(l => bodies.forEach(b => combinations.push({ hook: h, lead: l, body: b }))));
+
+  document.getElementById('status').innerText = `Creating folder and preparing ${combinations.length} combinations...`;
+  document.getElementById('result').innerHTML = '';
+
+  combinationData = [];
+  failedCombinations = [];
+
+  try {
+    document.getElementById('status').innerText = `Creating folder '${folderName}'...`;
+    await createFolder(folderName);
+    document.getElementById('status').innerText = `Folder created! Generating ${combinations.length} combinations in parallel...`;
+
+    // Create UI rows and store data
+    combinations.forEach((combo, i) => {
+      const resultRow = document.createElement('div');
+      resultRow.className = 'result-row';
+      resultRow.id = `result-row-${i}`;
+      resultRow.innerHTML = `
+        <video width="150" height="90"></video>
+        <div class="result-info">
+          <strong>Combination ${i + 1}</strong>
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="progress-${i}"></div>
+          </div>
+          <div class="status-text" id="status-${i}">Ready to process...</div>
+          <div class="retry-container" id="retry-container-${i}" style="display:none;"></div>
+        </div>
+      `;
+      document.getElementById('result').appendChild(resultRow);
+
+      combinationData[i] = { combo, folderName, index: i };
+    });
+
+    // Process in batches
+    for (let i = 0; i < combinations.length; i += MAX_CONCURRENT) {
+      const batch = combinations.slice(i, i + MAX_CONCURRENT);
+      const batchPromises = batch.map((combo, batchIndex) => {
+        const globalIndex = i + batchIndex;
+        return processCombinationParallel(combo, folderName, globalIndex)
+          .then(() => ({ success: true, index: globalIndex }))
+          .catch(err => {
+            failedCombinations.push({ combo, folderName, index: globalIndex, error: err.message || String(err) });
+            showRetryButton(globalIndex);
+            // ensure UI shows error state
+            const statusEl = document.getElementById(`status-${globalIndex}`);
+            if (statusEl) {
+              statusEl.innerText = `Error: ${err.message || 'Processing failed'}`;
+              statusEl.className = 'status-text error-text';
+            }
+            return { success: false, index: globalIndex, error: err.message || String(err) };
+          });
+      });
+
+      const results = await Promise.allSettled(batchPromises);
+
+      const successful = results.filter(r => r.status === 'fulfilled' && r.value && r.value.success).length;
+      const failed = results.filter(r => r.status === 'fulfilled' && r.value && !r.value.success).length;
+
+      document.getElementById('status').innerText =
+        `Processed ${Math.min(i + MAX_CONCURRENT, combinations.length)}/${combinations.length} combinations (✓ ${successful}, ✗ ${failed})`;
+    }
+
+    updateFinalStatus(combinations.length);
+  } catch (err) {
+    console.error('generateVideo error', err);
+    const st = document.getElementById('status');
+    st.innerText = `Error: ${err.message || err}`;
+    st.className = 'status-text error-text';
+  }
+}
+
+/* === processCombinationParallel ===
+   Upload hook/lead/body in parallel, then call n8n to combine.
+   Updates progress & UI.
+*/
+async function processCombinationParallel(combo, folderName, index) {
+  // update UI
+  const statusEl = document.getElementById(`status-${index}`);
+  const progressEl = document.getElementById(`progress-${index}`);
+
+  if (statusEl) statusEl.innerText = 'Uploading videos...';
+  if (progressEl) progressEl.style.width = '20%';
+
+  try {
+    // Upload three files in parallel
+    const [hookData, leadData, bodyData] = await Promise.all([
+      uploadToSupabase(combo.hook, folderName, 'hook', index),
+      uploadToSupabase(combo.lead, folderName, 'lead', index),
+      uploadToSupabase(combo.body, folderName, 'body', index)
+    ]);
+
+    if (progressEl) progressEl.style.width = '60%';
+    if (statusEl) statusEl.innerText = 'Combining videos...';
+
+    // send to n8n/lambda (proxied by backend)
+    const response = await sendToN8N(hookData, leadData, bodyData, folderName, index);
+
+    if (progressEl) progressEl.style.width = '100%';
+
+    // find the resultRow and update actions/UI
+    const resultRow = document.getElementById(`result-row-${index}`);
+    if (resultRow) {
+      updateResultRowWithActions(resultRow, response, index);
+    }
+
+    if (statusEl) statusEl.innerText = 'Complete!';
+
+    return response;
+  } catch (err) {
+    console.error('processCombinationParallel', err);
+    if (statusEl) {
+      statusEl.innerText = 'Error: ' + (err.message || String(err));
+      statusEl.className = 'status-text error-text';
+    }
+    throw err;
+  }
+}
+
+/* === Retry UI functions === */
+function showRetryButton(index) {
+  const retryContainer = document.getElementById(`retry-container-${index}`);
+  if (!retryContainer) return;
+  retryContainer.innerHTML = `
+    <button class="retry-btn" onclick="retryCombination(${index})">🔄 Retry</button>
+  `;
+  retryContainer.style.display = 'block';
+}
+
+async function retryCombination(index) {
+  const comboData = combinationData[index];
+  if (!comboData) {
+    alert('Cannot retry: Original combination data not found.');
+    return;
+  }
+
+  const { combo, folderName } = comboData;
+  const progressEl = document.getElementById(`progress-${index}`);
+  const statusEl = document.getElementById(`status-${index}`);
+  const retryContainer = document.getElementById(`retry-container-${index}`);
+
+  if (progressEl) progressEl.style.width = '0%';
+  if (statusEl) {
+    statusEl.innerText = 'Retrying...';
+    statusEl.className = 'status-text';
+  }
+  if (retryContainer) retryContainer.innerHTML = '';
+
+  try {
+    await processCombinationParallel(combo, folderName, index);
+    if (statusEl) statusEl.innerText = 'Retry successful!';
+    failedCombinations = failedCombinations.filter(f => f.index !== index);
+    updateFinalStatus(combinationData.length);
+  } catch (err) {
+    if (statusEl) {
+      statusEl.innerText = 'Retry failed: ' + (err.message || String(err));
+      statusEl.className = 'status-text error-text';
+    }
+    showRetryButton(index);
+  }
+}
+
+async function retryAllFailed() {
+  if (failedCombinations.length === 0) {
+    alert('No failed combinations to retry.');
+    return;
+  }
+
+  document.getElementById('status').innerText = `Retrying ${failedCombinations.length} failed combinations...`;
+  const currentFailed = [...failedCombinations]; // copy to iterate
+  const results = await Promise.allSettled(currentFailed.map(f => retryCombination(f.index)));
+
+  // filter out succeeders
+  failedCombinations = failedCombinations.filter(f => {
+    // if corresponding status shows complete, remove
+    const st = document.getElementById(`status-${f.index}`);
+    return st && !st.innerText.toLowerCase().includes('successful');
+  });
+
+  updateFinalStatus(combinationData.length);
+}
+
+/* === Final status updater === */
+function updateFinalStatus(totalCombinations) {
+  const status = document.getElementById('status');
+  if (failedCombinations.length > 0) {
+    const successCount = totalCombinations - failedCombinations.length;
+    status.innerHTML =
+      `Completed ${successCount}/${totalCombinations} combinations successfully. ` +
+      `<span style="color: #ef4444;">${failedCombinations.length} failed.</span> ` +
+      `<button onclick="retryAllFailed()" style="margin-left: 10px; padding: 4px 12px; background: #ef4444; color: white; border: none; border-radius: 4px; cursor: pointer;">Retry All Failed</button>`;
+  } else {
+    status.innerText = `All ${totalCombinations} combinations completed successfully!`;
+  }
+}
+
+/* === Update result row with action buttons & time ===
+   Response shape is flexible; handle common fields carefully.
+*/
+function updateResultRowWithActions(resultRow, response, index) {
+  // Normalize access
+  const webhook = response?.webhook || {};
+  const supabaseResp = response?.supabase || response?.supabase || {};
+  const metadata = response?.metadata || {};
+
+  const final_url = response?.outputUrl || webhook?.final_url || response?.finalUrl || response?.final_url;
+  const drive_link = webhook?.drive_link || metadata?.drive_link || webhook?.gdrive_link || null;
+  const datetime_processed =
+    webhook?.datetime_processed ||
+    metadata?.datetime_processed ||
+    new Date().toLocaleString('en-US', {
+      timeZone: 'Asia/Dubai',
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+
+  const googleDriveSuccess = webhook?.googleDriveSuccess ?? metadata?.googleDriveSuccess;
+
+  // Update video
+  const videoElement = resultRow.querySelector('video');
+  if (videoElement && final_url) {
+    videoElement.src = final_url;
+    videoElement.controls = true;
+  } else if (videoElement) {
+    // show placeholder or blank
+    videoElement.removeAttribute('src');
+    videoElement.controls = false;
+  }
+
+  // status text (ensure we select the correct element)
+  const statusElement = resultRow.querySelector(`#status-${index}`) || resultRow.querySelector('.status-text');
+  if (statusElement) statusElement.innerText = 'Complete!';
+
+  // action buttons
+  const actionButtons = document.createElement('div');
+  actionButtons.className = 'action-buttons';
+
+  // Download button (if final_url)
+  if (final_url) {
+    const downloadBtn = document.createElement('a');
+    downloadBtn.href = final_url;
+    downloadBtn.download = `combined-video-${index + 1}.mp4`;
+    downloadBtn.className = 'action-btn download-btn';
+    downloadBtn.innerHTML = '📥 Download Video';
+    downloadBtn.target = '_blank';
+    actionButtons.appendChild(downloadBtn);
+  }
+
+  // Drive button
+  if (drive_link && !drive_link.includes('failed') && googleDriveSuccess !== false) {
+    const driveBtn = document.createElement('a');
+    driveBtn.href = drive_link;
+    driveBtn.className = 'action-btn drive-btn';
+    driveBtn.innerHTML = '📁 Open Google Drive';
+    driveBtn.target = '_blank';
+    actionButtons.appendChild(driveBtn);
+  }
+
+  // Append actions and processed time to result-info
+  const resultInfo = resultRow.querySelector('.result-info');
+  if (resultInfo) {
+    // remove any existing action-buttons to avoid duplication
+    const existing = resultInfo.querySelector('.action-buttons');
+    if (existing) existing.remove();
+
+    resultInfo.appendChild(actionButtons);
+
+    const processedTime = document.createElement('div');
+    processedTime.className = 'processed-time';
+    processedTime.innerText = `Processed: ${datetime_processed}`;
+    resultInfo.appendChild(processedTime);
+
+    // optionally show metadata summary
+    if (metadata && Object.keys(metadata).length > 0) {
+      const metaDiv = document.createElement('div');
+      metaDiv.style.fontSize = '0.8rem';
+      metaDiv.style.color = '#6b7280';
+      metaDiv.style.marginTop = '6px';
+      metaDiv.innerText = `RenderId: ${metadata.renderId || metadata.render_id || '-'} | Status: ${metadata.renderStatus || metadata.render_status || '-'}`;
+      resultInfo.appendChild(metaDiv);
+    }
+  }
+
+  // Add Google Drive retry button if drive upload failed
+  addGoogleDriveRetryButton(resultRow, response, index);
+}
+
+/* === Add Google Drive retry UI if detected failed drive upload === */
+function addGoogleDriveRetryButton(resultRow, response, index) {
+  const webhook = response?.webhook || {};
+  const metadata = response?.metadata || {};
+  const drive_link = webhook?.drive_link || metadata?.drive_link;
+  const googleDriveSuccess = webhook?.googleDriveSuccess ?? metadata?.googleDriveSuccess;
+
+  if (!googleDriveSuccess && drive_link && (drive_link.includes('failed') || drive_link.includes('Execute previous nodes') || drive_link.includes('[Execute'))) {
+    const retryContainer = document.getElementById(`retry-container-${index}`);
+    if (retryContainer) {
+      // Avoid adding duplicates
+      if (!retryContainer.querySelector('.retry-google-drive')) {
+        const retryBtn = document.createElement('button');
+        retryBtn.className = 'retry-btn retry-google-drive';
+        retryBtn.innerHTML = '🔄 Retry Google Drive';
+        retryBtn.onclick = () => retryGoogleDriveUpload(index, response);
+        retryContainer.appendChild(retryBtn);
+        retryContainer.style.display = 'block';
+      }
+    }
+  }
+}
+
+/* === retryGoogleDriveUpload ===
+   Calls backend retry endpoint to attempt re-upload to Google Drive.
+   Endpoint: /api/retry-google-drive (proxied)
+*/
+async function retryGoogleDriveUpload(index, originalResponse) {
+  const retryContainer = document.getElementById(`retry-container-${index}`);
+  const statusElement = document.getElementById(`status-${index}`);
+
+  if (retryContainer) retryContainer.innerHTML = '<span style="color:#f59e0b;">Retrying Google Drive upload...</span>';
+  if (statusElement) statusElement.innerText = 'Retrying Google Drive upload...';
+
+  try {
+    // Build retry payload from originalResponse fields (safe checks)
+    const webhook = originalResponse?.webhook || {};
+    const metadata = originalResponse?.metadata || {};
+    const supabaseResp = originalResponse?.supabase || {};
+
+    const retryPayload = {
+      hookName: (webhook?.hookData_url || '').split('/').pop(),
+      leadName: (webhook?.leadData_url || '').split('/').pop(),
+      bodyName: (webhook?.bodyData_url || '').split('/').pop(),
+      hookUrl: webhook?.hookData_url || '',
+      leadUrl: webhook?.leadData_url || '',
+      bodyUrl: webhook?.bodyData_url || '',
+      finalVideoUrl: webhook?.final_url || originalResponse?.outputUrl || '',
+      renderId: metadata?.renderId || metadata?.render_id || null,
+      renderStatus: metadata?.renderStatus || metadata?.render_status || null,
+      folderName: metadata?.folderName || metadata?.folder_name || null,
+      combinationIndex: metadata?.combinationIndex ?? metadata?.combination_index ?? index,
+      timestamp: new Date().toISOString(),
+      supabasePublicUrl: supabaseResp?.public_url || supabaseResp?.publicUrl || null,
+      supabasePath: supabaseResp?.path || null,
+      metadata
+    };
+
+    const r = await fetch('/api/retry-google-drive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(retryPayload)
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => null);
+      throw new Error(txt || `retry endpoint returned ${r.status}`);
+    }
+
+    const result = await r.json();
+
+    if (result.success && result.drive_link && !result.drive_link.includes('failed')) {
+      // update or add Drive button
+      const driveBtnExisting = document.querySelector(`#result-row-${index} .drive-btn`);
+      if (driveBtnExisting) {
+        driveBtnExisting.href = result.drive_link;
+      } else {
+        const actionButtons = document.querySelector(`#result-row-${index} .action-buttons`);
+        if (actionButtons) {
+          const newDriveBtn = document.createElement('a');
+          newDriveBtn.href = result.drive_link;
+          newDriveBtn.className = 'action-btn drive-btn';
+          newDriveBtn.innerHTML = '📁 Open Google Drive';
+          newDriveBtn.target = '_blank';
+          actionButtons.appendChild(newDriveBtn);
+        }
+      }
+
+      if (statusElement) statusElement.innerText = 'Google Drive upload successful!';
+      if (retryContainer) {
+        retryContainer.innerHTML = '<span style="color:#10b981;">✓ Google Drive uploaded</span>';
+        setTimeout(() => (retryContainer.style.display = 'none'), 2500);
+      }
+    } else {
+      throw new Error(result.error || 'Drive retry failed');
+    }
+  } catch (err) {
+    console.error('retryGoogleDriveUpload', err);
+    if (statusElement) {
+      statusElement.innerText = 'Retry failed: ' + (err.message || String(err));
+      statusElement.className = 'status-text error-text';
+    }
+    if (retryContainer) {
+      retryContainer.innerHTML = `<button class="retry-btn" onclick="retryGoogleDriveUpload(${index}, ${JSON.stringify(originalResponse)})">🔄 Retry Again</button>`;
+    }
+  }
+}
+
+// /* === Export for console (optional) ===
+//    If you want to call functions from console during dev.
+// */
+// window.generateVideo = generateVideo;
+// window.retryAllFailed = retryAllFailed;
+// window.retryCombination = retryCombination;
+// window.retryGoogleDriveUpload = retryGoogleDriveUpload;
+
 
 </script>
 </body>
